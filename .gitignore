@@ -1,0 +1,11 @@
+.env
+.env.local
+credentials.json
+*.json
+!package.json
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+venv/
+.vscode/
+.idea/
