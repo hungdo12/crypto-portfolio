@@ -1,19 +1,16 @@
 """
-Crypto Portfolio Manager - Streamlit App v2
-============================================
+Crypto Portfolio Manager - Streamlit App v3 (Deploy-Ready)
+============================================================
 Giao diện quản lý đầu tư crypto, đồng bộ với Google Sheets.
 
-Tính năng:
-- Dashboard tổng quan với KPI cards
-- Thêm giao dịch BUY/SELL nhanh
-- Xem chi tiết portfolio theo token
-- Lịch sử giao dịch + export CSV
-- Cấu hình cảnh báo Telegram
-- Cảnh báo concentration risk (1 chain > 50%)
-- Auto-refresh giá real-time
-- Sort portfolio theo P&L
+v3 Updates:
+- Hỗ trợ cả local (.env + credentials.json) lẫn cloud (Streamlit Secrets)
+- Tự động phát hiện môi trường
+- Fix bug Vega-Lite chart
+- Cảnh báo concentration risk
 
-Chạy: streamlit run app.py
+Chạy local: streamlit run app.py
+Deploy cloud: push lên GitHub, deploy qua https://share.streamlit.io
 """
 
 import streamlit as st
@@ -23,8 +20,10 @@ from google.oauth2.service_account import Credentials
 from datetime import datetime
 import requests
 import os
+import json
 from dotenv import load_dotenv
 
+# Load .env nếu chạy local
 load_dotenv()
 
 # ====================== CONFIG ======================
@@ -40,9 +39,6 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
-SHEET_ID = os.getenv('GOOGLE_SHEET_ID', '').strip()
-CREDS_FILE = os.getenv('GOOGLE_CREDS_FILE', 'credentials.json').strip()
-
 NETWORKS = {
     'ETH': {'chain_id': 1, 'dex': 'uniswap'},
     'BSC': {'chain_id': 56, 'dex': 'pancakeswap'},
@@ -53,6 +49,45 @@ NETWORKS = {
     'POLYGON': {'chain_id': 137, 'dex': 'quickswap'},
     'SOLANA': {'chain_id': 0, 'dex': 'raydium'},
 }
+
+
+# ====================== CONFIG LOADER (Smart) ======================
+def get_config(key: str, default: str = '') -> str:
+    """
+    Đọc config từ Streamlit Secrets (cloud) trước, fallback .env (local).
+    """
+    # Thử lấy từ Streamlit Secrets trước (cho cloud)
+    try:
+        if hasattr(st, 'secrets') and key in st.secrets:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        pass
+    
+    # Fallback về .env (cho local)
+    return os.getenv(key, default).strip()
+
+
+def get_credentials():
+    """
+    Lấy Google credentials từ Streamlit Secrets (cloud) hoặc file (local).
+    """
+    # Thử lấy từ Streamlit Secrets trước
+    try:
+        if hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
+            creds_dict = dict(st.secrets['gcp_service_account'])
+            return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    except Exception as e:
+        pass
+    
+    # Fallback về file credentials.json (cho local)
+    creds_file = get_config('GOOGLE_CREDS_FILE', 'credentials.json')
+    if os.path.exists(creds_file):
+        return Credentials.from_service_account_file(creds_file, scopes=SCOPES)
+    
+    return None
+
+
+SHEET_ID = get_config('GOOGLE_SHEET_ID')
 
 
 # ====================== HELPER: CLEAN NUMBER ======================
@@ -76,12 +111,10 @@ def clean_number(val):
 
 
 def format_money(val: float, decimals: int = 2) -> str:
-    """Format số tiền: $1,234.56"""
     return f"${val:,.{decimals}f}"
 
 
 def format_pct(val: float) -> str:
-    """Format phần trăm: +5.68%"""
     sign = '+' if val >= 0 else ''
     return f"{sign}{val:.2f}%"
 
@@ -91,7 +124,10 @@ def format_pct(val: float) -> str:
 def get_gsheet_client():
     """Kết nối Google Sheets API"""
     try:
-        creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+        creds = get_credentials()
+        if not creds:
+            st.error("❌ Không tìm thấy credentials! Check .env hoặc Streamlit Secrets.")
+            return None
         return gspread.authorize(creds)
     except Exception as e:
         st.error(f"❌ Lỗi kết nối Google Sheets: {e}")
@@ -100,7 +136,7 @@ def get_gsheet_client():
 
 @st.cache_data(ttl=60)
 def load_dataframe(sheet_name: str) -> pd.DataFrame:
-    """Đọc dữ liệu từ sheet thành DataFrame"""
+    """Đọc dữ liệu từ sheet"""
     client = get_gsheet_client()
     if not client or not SHEET_ID:
         return pd.DataFrame()
@@ -117,7 +153,7 @@ def load_dataframe(sheet_name: str) -> pd.DataFrame:
 
 
 def get_sheet(sheet_name: str):
-    """Lấy 1 sheet để ghi"""
+    """Lấy sheet để ghi"""
     client = get_gsheet_client()
     if not client or not SHEET_ID:
         return None
@@ -129,11 +165,10 @@ def get_sheet(sheet_name: str):
 
 
 def append_transaction(tx_data: dict):
-    """Thêm 1 giao dịch mới vào sheet Transactions"""
+    """Thêm GD mới"""
     sheet = get_sheet('Transactions')
     if not sheet:
         return False
-
     total_value = tx_data['amount'] * tx_data['price']
     row = [
         tx_data['date'], tx_data['type'], tx_data['token'], tx_data['network'],
@@ -145,30 +180,45 @@ def append_transaction(tx_data: dict):
     return True
 
 
-# ====================== PRICE FETCHING ======================
+# ====================== PRICE FETCHING (Smart Filter) ======================
 def fetch_price_dexscreener(contract: str, network: str) -> dict:
-    """Lấy giá token từ Dexscreener API (free, không cần key)"""
+    """Lấy giá token từ Dexscreener với smart filter"""
     network_map = {
         'ETH': 'ethereum', 'BSC': 'bsc', 'BASE': 'base',
         'ARB': 'arbitrum', 'POLYGON': 'polygon', 'SONEIUM': 'soneium',
         'SOLANA': 'solana',
     }
     chain = network_map.get(network.upper(), network.lower())
-
+    
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
         response = requests.get(url, timeout=10)
         data = response.json()
-
+        
         if not data.get('pairs'):
             return {'price': 0, 'error': 'Không tìm thấy pair'}
-
+        
+        # Strict chain matching
         pairs = [p for p in data['pairs'] if p.get('chainId') == chain]
         if not pairs:
-            pairs = data['pairs']
-
-        best_pair = max(pairs, key=lambda p: float(p.get('liquidity', {}).get('usd', 0) or 0))
-
+            return {'price': 0, 'error': f'Không có pool trên {network}'}
+        
+        # Filter liquidity > $1000
+        valid_pairs = [p for p in pairs 
+                       if float(p.get('liquidity', {}).get('usd', 0) or 0) > 1000]
+        if not valid_pairs:
+            valid_pairs = pairs
+        
+        # Ưu tiên trusted quote token
+        TRUSTED = ['WETH', 'WBNB', 'USDC', 'USDT', 'DAI', 'ETH', 'BNB', 'SOL', 'WSOL']
+        trusted = [p for p in valid_pairs 
+                   if p.get('quoteToken', {}).get('symbol', '').upper() in TRUSTED]
+        if trusted:
+            valid_pairs = trusted
+        
+        best_pair = max(valid_pairs, 
+                        key=lambda p: float(p.get('liquidity', {}).get('usd', 0) or 0))
+        
         return {
             'price': float(best_pair.get('priceUsd', 0) or 0),
             'price_change_24h': float(best_pair.get('priceChange', {}).get('h24', 0) or 0),
@@ -176,6 +226,9 @@ def fetch_price_dexscreener(contract: str, network: str) -> dict:
             'liquidity': float(best_pair.get('liquidity', {}).get('usd', 0) or 0),
             'fdv': float(best_pair.get('fdv', 0) or 0),
             'pair_url': best_pair.get('url', ''),
+            'pair_info': f"{best_pair.get('baseToken', {}).get('symbol')}/"
+                         f"{best_pair.get('quoteToken', {}).get('symbol')} "
+                         f"@ {best_pair.get('dexId')}",
             'error': None
         }
     except Exception as e:
@@ -183,27 +236,24 @@ def fetch_price_dexscreener(contract: str, network: str) -> dict:
 
 
 def update_portfolio_prices():
-    """Cập nhật giá hiện tại cho tất cả token trong Portfolio"""
+    """Update giá cho tất cả token"""
     sheet = get_sheet('Portfolio')
     if not sheet:
         return 0
-
     df = load_dataframe('Portfolio')
     if df.empty:
         return 0
-
+    
     updated = 0
     for idx, row in df.iterrows():
         contract = row.get('Contract', '')
         network = row.get('Mạng', '')
         if not contract or not network:
             continue
-
         result = fetch_price_dexscreener(contract, network)
         if result['price'] > 0:
             sheet.update_cell(idx + 2, 9, result['price'])
             updated += 1
-
     st.cache_data.clear()
     return updated
 
@@ -212,15 +262,15 @@ def update_portfolio_prices():
 with st.sidebar:
     st.title("💰 Crypto Portfolio")
     st.markdown("---")
-
+    
     page = st.radio(
         "📍 Menu",
-        ["📊 Dashboard", "➕ Thêm Giao Dịch", "📋 Portfolio",
+        ["📊 Dashboard", "➕ Thêm Giao Dịch", "📋 Portfolio", 
          "📜 Lịch Sử", "🔔 Cảnh Báo", "⚙️ Cài Đặt"]
     )
-
+    
     st.markdown("---")
-
+    
     if st.button("🔄 Cập nhật giá real-time", use_container_width=True, type="primary"):
         with st.spinner("Đang lấy giá từ Dexscreener..."):
             count = update_portfolio_prices()
@@ -228,69 +278,72 @@ with st.sidebar:
             st.success(f"✅ Đã update {count} token!")
         else:
             st.warning("⚠️ Không update được")
-
+    
     if st.button("🔁 Refresh data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-
+    
     st.markdown("---")
     st.caption(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-    if SHEET_ID and os.path.exists(CREDS_FILE):
-        st.caption("🟢 Kết nối Google Sheets OK")
+    
+    # Hiển thị môi trường
+    is_cloud = hasattr(st, 'secrets') and 'GOOGLE_SHEET_ID' in st.secrets
+    env_label = "☁️ Cloud" if is_cloud else "💻 Local"
+    
+    if SHEET_ID:
+        st.caption(f"🟢 {env_label} - Kết nối OK")
     else:
-        st.caption("🔴 Chưa cấu hình .env")
+        st.caption(f"🔴 {env_label} - Chưa cấu hình")
 
 
 # ====================== PAGE: DASHBOARD ======================
 if page == "📊 Dashboard":
     st.title("📊 Dashboard Tổng Quan")
-
+    
     df_pf = load_dataframe('Portfolio')
-
+    
     if df_pf.empty:
         st.warning("⚠️ Chưa có dữ liệu. Vào 'Thêm Giao Dịch' để bắt đầu.")
     else:
-        money_cols = ['Tổng Chi USD', 'Giá Trị Hiện Tại', 'P&L USD',
+        money_cols = ['Tổng Chi USD', 'Giá Trị Hiện Tại', 'P&L USD', 
                       'Giá TB Mua', 'Giá Hiện Tại', 'SL Đang Giữ']
         for col in money_cols:
             if col in df_pf.columns:
                 df_pf[col] = df_pf[col].apply(clean_number)
-
+        
         if 'P&L %' in df_pf.columns:
             df_pf['P&L %'] = df_pf['P&L %'].apply(clean_number)
             if df_pf['P&L %'].abs().max() < 1 and df_pf['P&L %'].abs().max() > 0:
                 df_pf['P&L %'] = df_pf['P&L %'] * 100
-
+        
         total_cost = df_pf['Tổng Chi USD'].sum()
         total_value = df_pf['Giá Trị Hiện Tại'].sum()
         total_pnl = total_value - total_cost
         roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0
-        num_tokens = (len(df_pf[df_pf['SL Đang Giữ'] > 0])
+        num_tokens = (len(df_pf[df_pf['SL Đang Giữ'] > 0]) 
                       if 'SL Đang Giữ' in df_pf.columns else len(df_pf))
-
+        
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("💰 Vốn Đầu Tư", format_money(total_cost))
-        col2.metric("📈 Giá Trị Hiện Tại", format_money(total_value),
+        col2.metric("📈 Giá Trị Hiện Tại", format_money(total_value), 
                     f"{total_pnl:+,.2f}")
         col3.metric("💵 P&L Tổng", format_money(total_pnl), format_pct(roi))
         col4.metric("🪙 Số Token", f"{num_tokens}")
-
+        
         st.markdown("---")
-
-        # Cảnh báo concentration risk
+        
         if 'Mạng' in df_pf.columns and total_value > 0:
             chain_alloc = df_pf.groupby('Mạng')['Giá Trị Hiện Tại'].sum()
             max_chain = chain_alloc.idxmax()
             max_pct = chain_alloc.max() / total_value * 100
-
+            
             if max_pct > 70:
                 st.error(f"🚨 **CẢNH BÁO TẬP TRUNG RỦI RO CAO**: {max_pct:.1f}% vốn đang ở **{max_chain}**. "
                          f"Khuyến nghị rebalance, không nên để 1 chain > 50%.")
             elif max_pct > 50:
                 st.warning(f"⚠️ **Cảnh báo**: {max_pct:.1f}% vốn đang ở **{max_chain}**. "
                            f"Cân nhắc đa dạng hóa.")
-
+        
         col_a, col_b = st.columns(2)
         with col_a:
             st.subheader("🚀 Top Lãi")
@@ -300,33 +353,32 @@ if page == "📊 Dashboard":
             winners['P&L USD'] = winners['P&L USD'].apply(format_money)
             winners['P&L %'] = winners['P&L %'].apply(format_pct)
             st.dataframe(winners, use_container_width=True, hide_index=True)
-
+        
         with col_b:
             st.subheader("📉 Top Lỗ")
             losers = df_pf.nsmallest(5, 'P&L USD')[available_cols].copy()
             losers['P&L USD'] = losers['P&L USD'].apply(format_money)
             losers['P&L %'] = losers['P&L %'].apply(format_pct)
             st.dataframe(losers, use_container_width=True, hide_index=True)
-
+        
         st.markdown("---")
-
+        
         col_c, col_d = st.columns([2, 3])
         with col_c:
             st.subheader("🌐 Phân Bổ Theo Mạng")
             network_alloc = df_pf.groupby('Mạng')['Giá Trị Hiện Tại'].sum().reset_index()
             network_alloc = network_alloc[network_alloc['Giá Trị Hiện Tại'] > 0]
-            network_alloc['%'] = (network_alloc['Giá Trị Hiện Tại'] /
+            network_alloc['%'] = (network_alloc['Giá Trị Hiện Tại'] / 
                                    network_alloc['Giá Trị Hiện Tại'].sum() * 100).round(2)
             network_alloc['Giá Trị Hiện Tại'] = network_alloc['Giá Trị Hiện Tại'].apply(format_money)
             network_alloc['%'] = network_alloc['%'].apply(lambda x: f"{x:.2f}%")
             st.dataframe(network_alloc, use_container_width=True, hide_index=True)
-
+        
         with col_d:
             st.subheader("📊 Tỷ Trọng Vốn")
             chain_data = df_pf.groupby('Mạng')['Giá Trị Hiện Tại'].sum()
             chain_data = chain_data[chain_data > 0].sort_values(ascending=False)
             if not chain_data.empty:
-                # Dùng progress bar thay cho bar chart để tránh lỗi Vega
                 total = chain_data.sum()
                 for chain_name, value in chain_data.items():
                     pct = (value / total * 100) if total > 0 else 0
@@ -342,7 +394,7 @@ if page == "📊 Dashboard":
 # ====================== PAGE: THÊM GIAO DỊCH ======================
 elif page == "➕ Thêm Giao Dịch":
     st.title("➕ Thêm Giao Dịch Mới")
-
+    
     st.subheader("🔍 Check giá trước khi nhập")
     col_check1, col_check2, col_check3 = st.columns([2, 1, 1])
     with col_check1:
@@ -363,56 +415,50 @@ elif page == "➕ Thêm Giao Dịch":
                     st.success(f"💰 Giá: **${result['price']:.10f}** | "
                               f"24h: **{result['price_change_24h']:+.2f}%** | "
                               f"Liquidity: **${result['liquidity']:,.0f}** | "
-                              f"FDV: **${result['fdv']:,.0f}**")
+                              f"Pool: {result.get('pair_info', '')}")
                     if result.get('pair_url'):
                         st.markdown(f"[🔗 Xem trên Dexscreener]({result['pair_url']})")
-
+    
     st.markdown("---")
-
+    
     with st.form("add_tx_form", clear_on_submit=True):
         st.subheader("📝 Nhập giao dịch")
         col1, col2 = st.columns(2)
-
+        
         with col1:
             tx_date = st.date_input("📅 Ngày giao dịch", value=datetime.now())
             tx_type = st.selectbox("📊 Loại", ['BUY', 'SELL'])
             token = st.text_input("🪙 Token Symbol", placeholder="VD: PEPE, BRETT")
             network = st.selectbox("🌐 Mạng", list(NETWORKS.keys()))
             contract = st.text_input("📋 Contract Address", placeholder="0x...")
-
+        
         with col2:
             amount = st.number_input("🔢 Số lượng Token", min_value=0.0, format="%.8f")
             price = st.number_input("💲 Giá/Token (USD)", min_value=0.0, format="%.10f")
-            pay_with = st.selectbox("💳 Thanh toán bằng",
+            pay_with = st.selectbox("💳 Thanh toán bằng", 
                                      ['USDT', 'USDC', 'ETH', 'BNB', 'SOL', 'BASE-ETH'])
             gas_fee = st.number_input("⛽ Phí Gas (USD)", min_value=0.0, format="%.4f")
             tx_hash = st.text_input("🔗 Tx Hash (optional)", placeholder="0x...")
-
+        
         if amount > 0 and price > 0:
             st.info(f"💵 **Tổng giá trị**: ${amount * price:,.4f} + phí ${gas_fee:.4f} = "
                    f"**${amount * price + gas_fee:,.4f}**")
-
+        
         note = st.text_area("📝 Ghi chú", placeholder="VD: DCA lần 3, mua khi dump")
-
-        submitted = st.form_submit_button("✅ Lưu Giao Dịch", type="primary",
+        
+        submitted = st.form_submit_button("✅ Lưu Giao Dịch", type="primary", 
                                           use_container_width=True)
-
+        
         if submitted:
             if not token or not contract or amount <= 0 or price <= 0:
                 st.error("❌ Vui lòng điền đầy đủ: Token, Contract, Số lượng, Giá!")
             else:
                 tx_data = {
                     'date': tx_date.strftime('%Y-%m-%d'),
-                    'type': tx_type,
-                    'token': token.upper(),
-                    'network': network,
-                    'contract': contract,
-                    'amount': amount,
-                    'price': price,
-                    'pay_with': pay_with,
-                    'gas_fee': gas_fee,
-                    'tx_hash': tx_hash,
-                    'note': note
+                    'type': tx_type, 'token': token.upper(), 'network': network,
+                    'contract': contract, 'amount': amount, 'price': price,
+                    'pay_with': pay_with, 'gas_fee': gas_fee,
+                    'tx_hash': tx_hash, 'note': note
                 }
                 if append_transaction(tx_data):
                     st.success(f"✅ Đã lưu giao dịch **{tx_type} {amount:,.0f} {token}** "
@@ -423,12 +469,12 @@ elif page == "➕ Thêm Giao Dịch":
 # ====================== PAGE: PORTFOLIO ======================
 elif page == "📋 Portfolio":
     st.title("📋 Chi Tiết Danh Mục")
-
+    
     df_pf = load_dataframe('Portfolio')
     if df_pf.empty:
         st.warning("⚠️ Chưa có dữ liệu.")
     else:
-        money_cols = ['Tổng Chi USD', 'Giá Trị Hiện Tại', 'P&L USD',
+        money_cols = ['Tổng Chi USD', 'Giá Trị Hiện Tại', 'P&L USD', 
                       'Giá TB Mua', 'Giá Hiện Tại', 'SL Đang Giữ']
         for col in money_cols:
             if col in df_pf.columns:
@@ -437,24 +483,23 @@ elif page == "📋 Portfolio":
             df_pf['P&L %'] = df_pf['P&L %'].apply(clean_number)
             if df_pf['P&L %'].abs().max() < 1 and df_pf['P&L %'].abs().max() > 0:
                 df_pf['P&L %'] = df_pf['P&L %'] * 100
-
+        
         col1, col2, col3 = st.columns([2, 2, 1])
         with col1:
-            filter_network = st.multiselect("🌐 Lọc mạng",
+            filter_network = st.multiselect("🌐 Lọc mạng", 
                                             options=df_pf['Mạng'].unique(),
                                             default=df_pf['Mạng'].unique())
         with col2:
-            sort_by = st.selectbox("🔃 Sắp xếp theo",
-                                    ['P&L USD ↓', 'P&L USD ↑', 'P&L % ↓', 'P&L % ↑',
+            sort_by = st.selectbox("🔃 Sắp xếp theo", 
+                                    ['P&L USD ↓', 'P&L USD ↑', 'P&L % ↓', 'P&L % ↑', 
                                      'Giá Trị ↓', 'Token A-Z'])
         with col3:
             show_only_holding = st.checkbox("Chỉ đang giữ", value=True)
-
+        
         df_filtered = df_pf[df_pf['Mạng'].isin(filter_network)].copy()
-
         if show_only_holding and 'SL Đang Giữ' in df_filtered.columns:
             df_filtered = df_filtered[df_filtered['SL Đang Giữ'] > 0]
-
+        
         sort_map = {
             'P&L USD ↓': ('P&L USD', False), 'P&L USD ↑': ('P&L USD', True),
             'P&L % ↓': ('P&L %', False), 'P&L % ↑': ('P&L %', True),
@@ -464,7 +509,7 @@ elif page == "📋 Portfolio":
             col, asc = sort_map[sort_by]
             if col in df_filtered.columns:
                 df_filtered = df_filtered.sort_values(col, ascending=asc)
-
+        
         st.dataframe(df_filtered, use_container_width=True, hide_index=True,
                      column_config={
                          "Tổng Chi USD": st.column_config.NumberColumn(format="$%.2f"),
@@ -479,7 +524,7 @@ elif page == "📋 Portfolio":
 # ====================== PAGE: LỊCH SỬ ======================
 elif page == "📜 Lịch Sử":
     st.title("📜 Lịch Sử Giao Dịch")
-
+    
     client = get_gsheet_client()
     if client and SHEET_ID:
         try:
@@ -491,13 +536,13 @@ elif page == "📜 Lịch Sử":
             df_tx = pd.DataFrame()
     else:
         df_tx = pd.DataFrame()
-
+    
     if df_tx.empty:
         st.warning("⚠️ Chưa có giao dịch nào.")
     else:
         col1, col2, col3 = st.columns(3)
         with col1:
-            filter_token = st.multiselect("🪙 Token",
+            filter_token = st.multiselect("🪙 Token", 
                                           options=df_tx['Token'].unique() if 'Token' in df_tx else [],
                                           default=[])
         with col2:
@@ -506,7 +551,7 @@ elif page == "📜 Lịch Sử":
             filter_network = st.multiselect("🌐 Mạng",
                                             options=df_tx['Mạng'].unique() if 'Mạng' in df_tx else [],
                                             default=[])
-
+        
         df_show = df_tx.copy()
         if filter_token:
             df_show = df_show[df_show['Token'].isin(filter_token)]
@@ -514,13 +559,13 @@ elif page == "📜 Lịch Sử":
             df_show = df_show[df_show['Loại'].isin(filter_type)]
         if filter_network:
             df_show = df_show[df_show['Mạng'].isin(filter_network)]
-
+        
         st.caption(f"📌 Hiển thị {len(df_show)}/{len(df_tx)} giao dịch")
         st.dataframe(df_show, use_container_width=True, hide_index=True)
-
+        
         csv = df_show.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
-            "📥 Tải xuống CSV (đã filter)",
+            "📥 Tải xuống CSV",
             data=csv,
             file_name=f"transactions_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime='text/csv'
@@ -530,33 +575,33 @@ elif page == "📜 Lịch Sử":
 # ====================== PAGE: CẢNH BÁO ======================
 elif page == "🔔 Cảnh Báo":
     st.title("🔔 Cấu Hình Cảnh Báo Telegram")
-
+    
     st.info("💡 Bot Python (`price_updater.py`) sẽ check giá mỗi 5 phút và gửi cảnh báo "
             "qua Telegram khi giá chạm target.")
-
+    
     with st.expander("➕ Thêm Cảnh Báo Mới", expanded=False):
         with st.form("add_alert", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
                 a_token = st.text_input("Token")
                 a_network = st.selectbox("Mạng", list(NETWORKS.keys()), key='alert_net')
-                a_type = st.selectbox("Loại", ['TAKE_PROFIT', 'STOP_LOSS',
+                a_type = st.selectbox("Loại", ['TAKE_PROFIT', 'STOP_LOSS', 
                                                 'PRICE_ABOVE', 'PRICE_BELOW'])
             with col2:
                 a_price = st.number_input("Giá Trigger (USD)", min_value=0.0, format="%.10f")
                 a_note = st.text_area("Ghi chú")
-
+            
             if st.form_submit_button("✅ Thêm Alert", type="primary"):
                 if a_token and a_price > 0:
                     sheet = get_sheet('Alerts')
                     if sheet:
-                        sheet.append_row([a_token.upper(), a_network, a_type, a_price,
+                        sheet.append_row([a_token.upper(), a_network, a_type, a_price, 
                                          'ACTIVE', '', a_note])
                         st.success("✅ Đã thêm alert!")
                         st.cache_data.clear()
                 else:
                     st.error("❌ Cần nhập Token và Giá Trigger")
-
+    
     df_alerts = load_dataframe('Alerts')
     if not df_alerts.empty:
         st.subheader("📋 Danh sách cảnh báo")
@@ -568,28 +613,31 @@ elif page == "🔔 Cảnh Báo":
 # ====================== PAGE: CÀI ĐẶT ======================
 elif page == "⚙️ Cài Đặt":
     st.title("⚙️ Cài Đặt")
-
+    
+    is_cloud = hasattr(st, 'secrets') and 'GOOGLE_SHEET_ID' in st.secrets
+    env_text = "☁️ Streamlit Cloud" if is_cloud else "💻 Local"
+    st.info(f"**Môi trường hiện tại**: {env_text}")
+    
     st.subheader("🔑 Kết Nối Hiện Tại")
     col1, col2 = st.columns(2)
     with col1:
-        st.text_input("Google Sheet ID", value=SHEET_ID if SHEET_ID else "(chưa cấu hình)",
+        st.text_input("Google Sheet ID", value=SHEET_ID if SHEET_ID else "(chưa cấu hình)", 
                       disabled=True)
-        st.text_input("Credentials file", value=CREDS_FILE, disabled=True)
     with col2:
-        tg_token_display = os.getenv('TELEGRAM_BOT_TOKEN', '')
-        st.text_input("Telegram Bot Token",
-                      value=(tg_token_display[:10] + "...") if tg_token_display else "(chưa cấu hình)",
+        tg_token = get_config('TELEGRAM_BOT_TOKEN')
+        st.text_input("Telegram Bot Token", 
+                      value=(tg_token[:10] + "...") if tg_token else "(chưa cấu hình)",
                       disabled=True)
-        st.text_input("Telegram Chat ID",
-                      value=os.getenv('TELEGRAM_CHAT_ID', '(chưa cấu hình)'),
+        st.text_input("Telegram Chat ID", 
+                      value=get_config('TELEGRAM_CHAT_ID', '(chưa cấu hình)'), 
                       disabled=True)
-
+    
     st.markdown("---")
-
+    
     st.subheader("📱 Test Telegram")
     if st.button("📤 Test gửi tin nhắn", type="primary"):
-        tg_token = os.getenv('TELEGRAM_BOT_TOKEN')
-        tg_chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        tg_token = get_config('TELEGRAM_BOT_TOKEN')
+        tg_chat_id = get_config('TELEGRAM_CHAT_ID')
         if tg_token and tg_chat_id:
             try:
                 url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
@@ -604,11 +652,11 @@ elif page == "⚙️ Cài Đặt":
             except Exception as e:
                 st.error(f"❌ {e}")
         else:
-            st.warning("⚠️ Chưa cấu hình Telegram trong .env")
-
+            st.warning("⚠️ Chưa cấu hình Telegram")
+    
     st.markdown("---")
-    st.subheader("📊 Thông tin Sheet")
-    if st.button("🔍 Kiểm tra kết nối"):
+    st.subheader("📊 Kiểm tra kết nối")
+    if st.button("🔍 Test kết nối Sheet"):
         client = get_gsheet_client()
         if client and SHEET_ID:
             try:
@@ -616,16 +664,19 @@ elif page == "⚙️ Cài Đặt":
                 st.success(f"✅ Kết nối OK!")
                 st.write(f"**File**: {ss.title}")
                 st.write(f"**URL**: {ss.url}")
-                st.write(f"**Các sheet**: {', '.join([s.title for s in ss.worksheets()])}")
+                st.write(f"**Sheets**: {', '.join([s.title for s in ss.worksheets()])}")
             except Exception as e:
                 st.error(f"❌ {e}")
-
+    
     st.markdown("---")
-    st.subheader("📖 Hướng Dẫn Setup")
+    st.subheader("📖 Hướng Dẫn")
     st.markdown("""
-    1. **Google Sheets API**: Tạo project trên Google Cloud Console, bật `Google Sheets API` và `Google Drive API`, tạo Service Account, tải file JSON
-    2. **Share Sheet**: Share Google Sheet (quyền Editor) cho email service account
-    3. **Telegram Bot**: Chat với @BotFather → `/newbot` → lấy token. Chat với @userinfobot để lấy Chat ID
-    4. **File .env**: Đặt `GOOGLE_SHEET_ID`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
-    5. **Chạy bot real-time**: `python price_updater.py` (mở terminal khác)
+    Xem **README.md** và **DEPLOY_GUIDE.md** trong repo để biết cách setup từng bước.
+    
+    **Tóm tắt nhanh:**
+    1. Setup Google Service Account + bật API Sheets & Drive
+    2. Share Google Sheet (Editor) cho email service account
+    3. Tạo Telegram bot qua @BotFather
+    4. Cấu hình `.env` (local) hoặc Streamlit Secrets (cloud)
+    5. Chạy app: `streamlit run app.py`
     """)
