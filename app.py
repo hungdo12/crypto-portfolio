@@ -54,7 +54,9 @@ NETWORKS = {
     'SOLANA': {'chain_id': 0, 'dex': 'raydium'},
 }
 
-# ====================== CẤU TRÚC CỘT MỚI ======================
+# ====================================================================
+# CẤU TRÚC CỘT MỚI
+# ====================================================================
 # Tên cột chính xác trong Google Sheet (sau khi đã sửa)
 COL = {
     'token': 'Token',
@@ -78,9 +80,97 @@ COL = {
     'portfolio_pct': '% Danh Mục',
 }
 
+# Cấu trúc cột sheet Wallet
+WALLET_COL = {
+    'date': 'Ngày',
+    'type': 'Loại',         # DEPOSIT | WITHDRAWAL | BALANCE
+    'network': 'Mạng',
+    'coin': 'Đồng',         # ETH | USDT | USDC
+    'amount': 'Số lượng',
+    'price': 'Giá USD',
+    'value': 'Giá Trị USD',
+    'tx_hash': 'Tx Hash',
+    'note': 'Ghi chú',
+}
+
 # Cột chứa giá hiện tại trong sheet — cần để biết cell nào update khi fetch giá mới
-# (theo cấu trúc mới: A,B,C,D,E,F,G,H,I = 9 cột đầu, I = Giá Hiện Tại)
 CURRENT_PRICE_COL_INDEX = 9  # cột I = thứ 9
+
+
+# ====================================================================
+# WALLET — Đọc và tính toán
+# ====================================================================
+def load_wallet_data() -> dict:
+    """
+    Đọc sheet Wallet và tính:
+    - total_deposit, total_withdrawal, net_capital
+    - eth_balance (USD value, từ tổng các dòng BALANCE)
+    
+    Returns dict với keys: total_deposit, total_withdrawal, net_capital, eth_balance
+    """
+    result = {
+        'total_deposit': 0.0,
+        'total_withdrawal': 0.0,
+        'net_capital': 0.0,
+        'eth_balance': 0.0,
+        'has_wallet_sheet': False,
+    }
+    
+    client = get_gsheet_client()
+    if not client or not SHEET_ID:
+        return result
+    
+    try:
+        sheet = client.open_by_key(SHEET_ID).worksheet('Wallet')
+        data = sheet.get_all_records()
+    except Exception:
+        # Sheet Wallet chưa tồn tại — fallback gracefully
+        return result
+    
+    result['has_wallet_sheet'] = True
+    
+    for row in data:
+        loai = str(row.get(WALLET_COL['type'], '')).strip().upper()
+        val = clean_number(row.get(WALLET_COL['value'], 0))
+        
+        if loai == 'DEPOSIT':
+            result['total_deposit'] += val
+        elif loai == 'WITHDRAWAL':
+            result['total_withdrawal'] += val
+        elif loai == 'BALANCE':
+            result['eth_balance'] += val
+    
+    result['net_capital'] = result['total_deposit'] - result['total_withdrawal']
+    return result
+
+
+def append_wallet_entry(entry: dict) -> bool:
+    """Thêm 1 dòng vào sheet Wallet."""
+    sheet = get_sheet('Wallet')
+    if not sheet:
+        return False
+    
+    value_usd = entry['amount'] * entry['price']
+    row = [
+        entry['date'], entry['type'], entry['network'], entry['coin'],
+        entry['amount'], entry['price'], value_usd,
+        entry.get('tx_hash', ''), entry.get('note', '')
+    ]
+    sheet.append_row(row, value_input_option='USER_ENTERED')
+    st.cache_data.clear()
+    return True
+
+
+def fetch_eth_price() -> float:
+    """Lấy giá ETH hiện tại từ Dexscreener (WETH trên ETH mainnet)."""
+    WETH_ETH = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+    try:
+        result = fetch_price_dexscreener(WETH_ETH, 'ETH')
+        if result['price'] > 0:
+            return result['price']
+    except Exception:
+        pass
+    return 2045.0  # fallback nếu API fail
 
 
 # ====================== CONFIG LOADER ======================
@@ -305,7 +395,7 @@ with st.sidebar:
     page = st.radio(
         "📍 Menu",
         ["📊 Dashboard", "➕ Thêm Giao Dịch", "📋 Portfolio",
-         "📜 Lịch Sử", "🔔 Cảnh Báo", "⚙️ Cài Đặt"]
+         "💎 Ví & Vốn", "📜 Lịch Sử", "🔔 Cảnh Báo", "⚙️ Cài Đặt"]
     )
     
     st.markdown("---")
@@ -393,6 +483,75 @@ if page == "📊 Dashboard":
             format_money(total_sell_revenue),
             help="Tổng tiền đã thu về từ các giao dịch bán (đã trừ gas)"
         )
+        
+        st.markdown("---")
+        
+        # === SECTION MỚI: VỐN THỰC & TỔNG TÀI SẢN ===
+        wallet = load_wallet_data()
+        
+        if wallet['has_wallet_sheet']:
+            st.markdown("##### 💎 Vốn Thực & Tổng Tài Sản")
+            
+            net_capital = wallet['net_capital']
+            eth_balance = wallet['eth_balance']
+            total_assets = total_value + eth_balance
+            real_pnl = total_assets - net_capital
+            real_roi = (real_pnl / net_capital * 100) if net_capital > 0 else 0
+            
+            col_w1, col_w2, col_w3 = st.columns(3)
+            col_w1.metric(
+                "💰 Vốn Ròng",
+                format_money(net_capital),
+                help=f"Tiền tươi từ ví ngoài (Deposit ${wallet['total_deposit']:,.2f} − "
+                     f"Withdrawal ${wallet['total_withdrawal']:,.2f})"
+            )
+            col_w2.metric(
+                "💎 Số Dư Ví",
+                format_money(eth_balance),
+                help="ETH/USDT đang giữ trong ví, chưa dùng mua token (từ dòng BALANCE trong sheet Wallet)"
+            )
+            col_w3.metric(
+                "🏦 Tổng Tài Sản",
+                format_money(total_assets),
+                help="Giá Trị Token + Số Dư Ví"
+            )
+            
+            col_p1, col_p2, col_p3 = st.columns(3)
+            col_p1.metric(
+                "📈 P&L Thực",
+                format_money(real_pnl),
+                format_pct(real_roi),
+                help="Tổng Tài Sản − Vốn Ròng. Đây mới là LÃI/LỖ THỰC SỰ"
+            )
+            col_p2.metric(
+                "💵 Tổng Deposit",
+                format_money(wallet['total_deposit']),
+                help="Tổng tiền đã nạp từ ví ngoài"
+            )
+            col_p3.metric(
+                "🏧 Tổng Withdrawal",
+                format_money(wallet['total_withdrawal']),
+                help="Tổng tiền đã rút về ví ngoài"
+            )
+            
+            # So sánh "P&L Tổng (cost basis)" vs "P&L Thực (cash flow)"
+            if abs(total_pnl - real_pnl) > 1:
+                with st.expander("ℹ️ Vì sao 'P&L Tổng' khác 'P&L Thực'?"):
+                    st.markdown(f"""
+                    - **P&L Tổng = ${total_pnl:,.2f}** → Tính theo cost basis từng token 
+                      (kiểu Binance Portfolio). Khi ae lấy tiền bán token A mua token B, 
+                      coi như 2 giao dịch độc lập, cộng dồn chi phí cả 2.
+                    
+                    - **P&L Thực = ${real_pnl:,.2f}** → Tính theo tiền tươi 
+                      (kiểu CoinTracker). Chỉ tính những đồng tiền THỰC SỰ vào/ra khỏi crypto.
+                    
+                    → **Cả 2 đều đúng**, nhưng **P&L Thực** mới phản ánh số tiền 
+                    ae thực sự lãi/lỗ trên vốn bỏ ra.
+                    """)
+        else:
+            st.info("💡 Tip: Tạo sheet **Wallet** trong Google Sheets để track vốn thực, "
+                    "số dư ETH/USDT trong ví và P&L thực sự (Vốn ròng vs Tổng tài sản). "
+                    "Xem hướng dẫn ở trang **💎 Ví & Vốn**.")
         
         st.markdown("---")
         
@@ -621,6 +780,202 @@ elif page == "📋 Portfolio":
             c2.metric("Giá Trị", format_money(sum_value))
             c3.metric("Realized", format_money(sum_realized))
             c4.metric("Unrealized", format_money(sum_unrealized))
+
+
+# ====================== PAGE: VÍ & VỐN ======================
+elif page == "💎 Ví & Vốn":
+    st.title("💎 Ví & Vốn Thực")
+    
+    wallet = load_wallet_data()
+    
+    if not wallet['has_wallet_sheet']:
+        st.warning("⚠️ Chưa có sheet **Wallet** trong Google Sheets!")
+        st.markdown("""
+        ### 📝 Cách tạo sheet Wallet:
+        
+        **Cách 1 (khuyến nghị)**: Upload file Excel đã có sẵn sheet Wallet
+        
+        **Cách 2**: Tạo thủ công sheet mới tên `Wallet` với 9 cột:
+        ```
+        Ngày | Loại | Mạng | Đồng | Số lượng | Giá USD | Giá Trị USD | Tx Hash | Ghi chú
+        ```
+        
+        **3 loại giao dịch:**
+        - `DEPOSIT`: Nạp tiền từ ví ngoài vào crypto (vốn mới)
+        - `WITHDRAWAL`: Rút từ crypto ra ví ngoài
+        - `BALANCE`: Snapshot số dư ETH/USDT trong ví (cập nhật thủ công)
+        """)
+        st.stop()
+    
+    # === Tóm tắt vốn ===
+    st.markdown("### 📊 Tóm tắt vốn")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("💰 Tổng Deposit", format_money(wallet['total_deposit']))
+    col2.metric("🏧 Tổng Withdrawal", format_money(wallet['total_withdrawal']))
+    col3.metric("💵 Vốn Ròng", format_money(wallet['net_capital']))
+    col4.metric("💎 Số Dư Ví (BALANCE)", format_money(wallet['eth_balance']))
+    
+    st.markdown("---")
+    
+    # === Thêm giao dịch ví ===
+    st.markdown("### ➕ Thêm Giao Dịch Ví")
+    
+    tab1, tab2, tab3 = st.tabs(["💰 DEPOSIT (Nạp)", "🏧 WITHDRAWAL (Rút)", "💎 BALANCE (Cập nhật số dư)"])
+    
+    with tab1:
+        st.caption("Nạp thêm tiền từ ví ngoài vào crypto. Vốn ròng sẽ tăng.")
+        with st.form("deposit_form", clear_on_submit=True):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                d_date = st.date_input("📅 Ngày nạp", value=datetime.now(), key='d_date')
+                d_network = st.selectbox("🌐 Mạng", list(NETWORKS.keys()), key='d_net', index=2)  # default BASE
+                d_coin = st.selectbox("🪙 Đồng", ['ETH', 'USDT', 'USDC', 'BNB', 'SOL'], key='d_coin')
+            with col_b:
+                d_amount = st.number_input("🔢 Số lượng", min_value=0.0, format="%.8f", key='d_amount')
+                d_price = st.number_input("💲 Giá USD/đồng", min_value=0.0, format="%.4f",
+                                          value=fetch_eth_price() if 'ETH' in 'ETH' else 1.0,
+                                          key='d_price')
+                d_note = st.text_input("📝 Ghi chú", placeholder="VD: Nạp thêm để DCA", key='d_note')
+            
+            if d_amount > 0 and d_price > 0:
+                st.info(f"💵 Giá trị: **${d_amount * d_price:,.2f}**")
+            
+            if st.form_submit_button("✅ Lưu DEPOSIT", type="primary", use_container_width=True):
+                if d_amount > 0 and d_price > 0:
+                    entry = {
+                        'date': d_date.strftime('%Y-%m-%d'),
+                        'type': 'DEPOSIT',
+                        'network': d_network,
+                        'coin': d_coin,
+                        'amount': d_amount,
+                        'price': d_price,
+                        'note': d_note,
+                    }
+                    if append_wallet_entry(entry):
+                        st.success(f"✅ Đã nạp {d_amount} {d_coin} (${d_amount * d_price:,.2f})")
+                        st.balloons()
+                else:
+                    st.error("❌ Vui lòng nhập số lượng và giá")
+    
+    with tab2:
+        st.caption("Rút tiền từ crypto về ví ngoài. Vốn ròng sẽ giảm, P&L thực tăng (chốt lãi).")
+        with st.form("withdraw_form", clear_on_submit=True):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                w_date = st.date_input("📅 Ngày rút", value=datetime.now(), key='w_date')
+                w_network = st.selectbox("🌐 Mạng", list(NETWORKS.keys()), key='w_net', index=2)
+                w_coin = st.selectbox("🪙 Đồng", ['ETH', 'USDT', 'USDC', 'BNB', 'SOL'], key='w_coin')
+            with col_b:
+                w_amount = st.number_input("🔢 Số lượng", min_value=0.0, format="%.8f", key='w_amount')
+                w_price = st.number_input("💲 Giá USD/đồng", min_value=0.0, format="%.4f",
+                                          value=fetch_eth_price(), key='w_price')
+                w_note = st.text_input("📝 Ghi chú", placeholder="VD: Rút chốt lãi về Binance", key='w_note')
+            
+            if w_amount > 0 and w_price > 0:
+                st.info(f"💵 Giá trị rút: **${w_amount * w_price:,.2f}**")
+            
+            if st.form_submit_button("✅ Lưu WITHDRAWAL", type="primary", use_container_width=True):
+                if w_amount > 0 and w_price > 0:
+                    entry = {
+                        'date': w_date.strftime('%Y-%m-%d'),
+                        'type': 'WITHDRAWAL',
+                        'network': w_network,
+                        'coin': w_coin,
+                        'amount': w_amount,
+                        'price': w_price,
+                        'note': w_note,
+                    }
+                    if append_wallet_entry(entry):
+                        st.success(f"✅ Đã rút {w_amount} {w_coin} (${w_amount * w_price:,.2f})")
+                else:
+                    st.error("❌ Vui lòng nhập số lượng và giá")
+    
+    with tab3:
+        st.caption("Cập nhật số dư ETH/USDT hiện tại trong ví (chưa dùng mua token). "
+                   "Khi cập nhật mới, app sẽ CỘNG DỒN các dòng BALANCE — nên ae cần xóa "
+                   "hoặc đổi loại dòng BALANCE cũ trước khi nhập mới.")
+        
+        st.warning("⚠️ **Lưu ý**: App tính tổng SUM tất cả dòng BALANCE. "
+                   "Nếu ae muốn cập nhật số dư mới, vào Google Sheets xóa dòng BALANCE cũ trước.")
+        
+        with st.form("balance_form", clear_on_submit=True):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                b_date = st.date_input("📅 Ngày snapshot", value=datetime.now(), key='b_date')
+                b_network = st.selectbox("🌐 Mạng", list(NETWORKS.keys()), key='b_net', index=2)
+                b_coin = st.selectbox("🪙 Đồng", ['ETH', 'USDT', 'USDC', 'BNB', 'SOL'], key='b_coin')
+            with col_b:
+                b_amount = st.number_input("🔢 Số dư hiện tại", min_value=0.0, format="%.8f", key='b_amount')
+                b_price = st.number_input("💲 Giá USD/đồng", min_value=0.0, format="%.4f",
+                                          value=fetch_eth_price(), key='b_price')
+                b_note = st.text_input("📝 Ghi chú", placeholder="VD: Snapshot sau khi bán SURPLUS",
+                                       key='b_note')
+            
+            if b_amount > 0 and b_price > 0:
+                st.info(f"💵 Giá trị: **${b_amount * b_price:,.2f}**")
+            
+            if st.form_submit_button("✅ Lưu BALANCE", type="primary", use_container_width=True):
+                if b_amount > 0 and b_price > 0:
+                    entry = {
+                        'date': b_date.strftime('%Y-%m-%d'),
+                        'type': 'BALANCE',
+                        'network': b_network,
+                        'coin': b_coin,
+                        'amount': b_amount,
+                        'price': b_price,
+                        'note': b_note,
+                    }
+                    if append_wallet_entry(entry):
+                        st.success(f"✅ Đã cập nhật số dư {b_amount} {b_coin} (${b_amount * b_price:,.2f})")
+                else:
+                    st.error("❌ Vui lòng nhập số lượng và giá")
+    
+    st.markdown("---")
+    
+    # === Hiển thị toàn bộ Wallet history ===
+    st.markdown("### 📜 Lịch sử Ví")
+    
+    client = get_gsheet_client()
+    if client and SHEET_ID:
+        try:
+            sheet = client.open_by_key(SHEET_ID).worksheet('Wallet')
+            wallet_data = sheet.get_all_records()
+            df_wallet = pd.DataFrame(wallet_data)
+            
+            if not df_wallet.empty:
+                # Filter ra các loại đã biết
+                if WALLET_COL['type'] in df_wallet.columns:
+                    df_wallet = df_wallet[df_wallet[WALLET_COL['type']].isin(
+                        ['DEPOSIT', 'WITHDRAWAL', 'BALANCE'])]
+                
+                st.dataframe(df_wallet, use_container_width=True, hide_index=True,
+                            column_config={
+                                WALLET_COL['amount']: st.column_config.NumberColumn(format="%.6f"),
+                                WALLET_COL['price']: st.column_config.NumberColumn(format="$%.4f"),
+                                WALLET_COL['value']: st.column_config.NumberColumn(format="$%.2f"),
+                            })
+            else:
+                st.info("Chưa có giao dịch ví nào.")
+        except Exception as e:
+            st.error(f"Lỗi đọc sheet Wallet: {e}")
+    
+    st.markdown("---")
+    
+    # === Tính P&L Thực ===
+    df_pf = load_dataframe('Portfolio')
+    if not df_pf.empty:
+        df_pf = clean_numeric_columns(df_pf)
+        total_value = df_pf[COL['current_value']].sum() if COL['current_value'] in df_pf else 0
+        total_assets = total_value + wallet['eth_balance']
+        real_pnl = total_assets - wallet['net_capital']
+        real_roi = (real_pnl / wallet['net_capital'] * 100) if wallet['net_capital'] > 0 else 0
+        
+        st.markdown("### 📈 Kết Quả P&L Thực")
+        col_pnl1, col_pnl2, col_pnl3, col_pnl4 = st.columns(4)
+        col_pnl1.metric("🪙 Giá Trị Token", format_money(total_value))
+        col_pnl2.metric("💎 Số Dư Ví", format_money(wallet['eth_balance']))
+        col_pnl3.metric("🏦 Tổng Tài Sản", format_money(total_assets))
+        col_pnl4.metric("📈 P&L Thực", format_money(real_pnl), format_pct(real_roi))
 
 
 # ====================== PAGE: LỊCH SỬ ======================
