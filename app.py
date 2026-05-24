@@ -1,12 +1,17 @@
 """
-Crypto Portfolio Manager - Streamlit App v3 (Deploy-Ready)
+Crypto Portfolio Manager - Streamlit App v4 (P&L Đúng)
 ============================================================
 Giao diện quản lý đầu tư crypto, đồng bộ với Google Sheets.
+
+v4 Updates (QUAN TRỌNG):
+- Đọc cấu trúc Portfolio MỚI (sau khi đã sửa công thức P&L)
+- Hiển thị tách Realized P&L / Unrealized P&L
+- Thêm metric "Vốn đã thu hồi" (Tổng DT Bán)
+- Dashboard cards mới chia 6 ô thay vì 4
 
 v3 Updates:
 - Hỗ trợ cả local (.env + credentials.json) lẫn cloud (Streamlit Secrets)
 - Tự động phát hiện môi trường
-- Fix bug Vega-Lite chart
 - Cảnh báo concentration risk
 
 Chạy local: streamlit run app.py
@@ -23,7 +28,6 @@ import os
 import json
 from dotenv import load_dotenv
 
-# Load .env nếu chạy local
 load_dotenv()
 
 # ====================== CONFIG ======================
@@ -50,47 +54,62 @@ NETWORKS = {
     'SOLANA': {'chain_id': 0, 'dex': 'raydium'},
 }
 
+# ====================== CẤU TRÚC CỘT MỚI ======================
+# Tên cột chính xác trong Google Sheet (sau khi đã sửa)
+COL = {
+    'token': 'Token',
+    'network': 'Mạng',
+    'contract': 'Contract',
+    'total_buy': 'Tổng SL Mua',
+    'total_sell': 'Tổng SL Bán',
+    'holding': 'SL Đang Giữ',
+    'total_cost': 'Tổng Chi USD',
+    'avg_buy_price': 'Giá TB Mua',
+    'current_price': 'Giá Hiện Tại',
+    'total_sell_revenue': 'Tổng DT Bán USD',  # MỚI
+    'avg_sell_price': 'Giá TB Bán',           # MỚI
+    'current_value': 'Giá Trị Hiện Tại',
+    'realized_pnl': 'Realized P&L',           # MỚI
+    'unrealized_pnl': 'Unrealized P&L',       # MỚI
+    'total_pnl': 'Total P&L',                 # ĐỔI TÊN (cũ: P&L USD)
+    'pnl_pct': 'P&L %',
+    'target': 'Target Chốt Lời',
+    'stop_loss': 'Stop Loss',
+    'portfolio_pct': '% Danh Mục',
+}
 
-# ====================== CONFIG LOADER (Smart) ======================
+# Cột chứa giá hiện tại trong sheet — cần để biết cell nào update khi fetch giá mới
+# (theo cấu trúc mới: A,B,C,D,E,F,G,H,I = 9 cột đầu, I = Giá Hiện Tại)
+CURRENT_PRICE_COL_INDEX = 9  # cột I = thứ 9
+
+
+# ====================== CONFIG LOADER ======================
 def get_config(key: str, default: str = '') -> str:
-    """
-    Đọc config từ Streamlit Secrets (cloud) trước, fallback .env (local).
-    """
-    # Thử lấy từ Streamlit Secrets trước (cho cloud)
     try:
         if hasattr(st, 'secrets') and key in st.secrets:
             return str(st.secrets[key]).strip()
     except Exception:
         pass
-    
-    # Fallback về .env (cho local)
     return os.getenv(key, default).strip()
 
 
 def get_credentials():
-    """
-    Lấy Google credentials từ Streamlit Secrets (cloud) hoặc file (local).
-    """
-    # Thử lấy từ Streamlit Secrets trước
     try:
         if hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
             creds_dict = dict(st.secrets['gcp_service_account'])
             return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    except Exception as e:
+    except Exception:
         pass
-    
-    # Fallback về file credentials.json (cho local)
     creds_file = get_config('GOOGLE_CREDS_FILE', 'credentials.json')
     if os.path.exists(creds_file):
         return Credentials.from_service_account_file(creds_file, scopes=SCOPES)
-    
     return None
 
 
 SHEET_ID = get_config('GOOGLE_SHEET_ID')
 
 
-# ====================== HELPER: CLEAN NUMBER ======================
+# ====================== HELPER ======================
 def clean_number(val):
     """Convert string từ Google Sheets ($1,234.56, (123), 5.68%) thành float."""
     if pd.isna(val) or val == '' or val is None:
@@ -110,7 +129,32 @@ def clean_number(val):
         return 0.0
 
 
+def clean_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert tất cả cột số trong DataFrame portfolio."""
+    money_cols = [
+        COL['total_cost'], COL['current_value'], COL['total_pnl'],
+        COL['avg_buy_price'], COL['current_price'],
+        COL['total_buy'], COL['total_sell'], COL['holding'],
+        COL['total_sell_revenue'], COL['avg_sell_price'],
+        COL['realized_pnl'], COL['unrealized_pnl'],
+    ]
+    for col in money_cols:
+        if col in df.columns:
+            df[col] = df[col].apply(clean_number)
+    
+    # P&L % và % Danh Mục — có thể bị Sheets format thành 0.x hoặc x%
+    for col in [COL['pnl_pct'], COL['portfolio_pct']]:
+        if col in df.columns:
+            df[col] = df[col].apply(clean_number)
+            # Nếu max < 1 thì đang ở dạng decimal → nhân 100
+            if not df[col].empty and df[col].abs().max() < 1 and df[col].abs().max() > 0:
+                df[col] = df[col] * 100
+    return df
+
+
 def format_money(val: float, decimals: int = 2) -> str:
+    if val < 0:
+        return f"(${abs(val):,.{decimals}f})"
     return f"${val:,.{decimals}f}"
 
 
@@ -119,10 +163,9 @@ def format_pct(val: float) -> str:
     return f"{sign}{val:.2f}%"
 
 
-# ====================== GOOGLE SHEETS CONNECTION ======================
+# ====================== GOOGLE SHEETS ======================
 @st.cache_resource
 def get_gsheet_client():
-    """Kết nối Google Sheets API"""
     try:
         creds = get_credentials()
         if not creds:
@@ -136,7 +179,6 @@ def get_gsheet_client():
 
 @st.cache_data(ttl=60)
 def load_dataframe(sheet_name: str) -> pd.DataFrame:
-    """Đọc dữ liệu từ sheet"""
     client = get_gsheet_client()
     if not client or not SHEET_ID:
         return pd.DataFrame()
@@ -144,8 +186,10 @@ def load_dataframe(sheet_name: str) -> pd.DataFrame:
         sheet = client.open_by_key(SHEET_ID).worksheet(sheet_name)
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
-        if not df.empty and 'Token' in df.columns:
-            df = df[df['Token'].notna() & (df['Token'] != '') & (df['Token'] != 'TỔNG')]
+        if not df.empty and COL['token'] in df.columns:
+            df = df[df[COL['token']].notna() &
+                    (df[COL['token']] != '') &
+                    (df[COL['token']] != 'TỔNG')]
         return df.reset_index(drop=True)
     except Exception as e:
         st.error(f"❌ Lỗi đọc sheet '{sheet_name}': {e}")
@@ -153,7 +197,6 @@ def load_dataframe(sheet_name: str) -> pd.DataFrame:
 
 
 def get_sheet(sheet_name: str):
-    """Lấy sheet để ghi"""
     client = get_gsheet_client()
     if not client or not SHEET_ID:
         return None
@@ -165,7 +208,6 @@ def get_sheet(sheet_name: str):
 
 
 def append_transaction(tx_data: dict):
-    """Thêm GD mới"""
     sheet = get_sheet('Transactions')
     if not sheet:
         return False
@@ -180,9 +222,8 @@ def append_transaction(tx_data: dict):
     return True
 
 
-# ====================== PRICE FETCHING (Smart Filter) ======================
+# ====================== PRICE FETCHING ======================
 def fetch_price_dexscreener(contract: str, network: str) -> dict:
-    """Lấy giá token từ Dexscreener với smart filter"""
     network_map = {
         'ETH': 'ethereum', 'BSC': 'bsc', 'BASE': 'base',
         'ARB': 'arbitrum', 'POLYGON': 'polygon', 'SONEIUM': 'soneium',
@@ -198,25 +239,22 @@ def fetch_price_dexscreener(contract: str, network: str) -> dict:
         if not data.get('pairs'):
             return {'price': 0, 'error': 'Không tìm thấy pair'}
         
-        # Strict chain matching
         pairs = [p for p in data['pairs'] if p.get('chainId') == chain]
         if not pairs:
             return {'price': 0, 'error': f'Không có pool trên {network}'}
         
-        # Filter liquidity > $1000
-        valid_pairs = [p for p in pairs 
+        valid_pairs = [p for p in pairs
                        if float(p.get('liquidity', {}).get('usd', 0) or 0) > 1000]
         if not valid_pairs:
             valid_pairs = pairs
         
-        # Ưu tiên trusted quote token
         TRUSTED = ['WETH', 'WBNB', 'USDC', 'USDT', 'DAI', 'ETH', 'BNB', 'SOL', 'WSOL']
-        trusted = [p for p in valid_pairs 
+        trusted = [p for p in valid_pairs
                    if p.get('quoteToken', {}).get('symbol', '').upper() in TRUSTED]
         if trusted:
             valid_pairs = trusted
         
-        best_pair = max(valid_pairs, 
+        best_pair = max(valid_pairs,
                         key=lambda p: float(p.get('liquidity', {}).get('usd', 0) or 0))
         
         return {
@@ -236,7 +274,7 @@ def fetch_price_dexscreener(contract: str, network: str) -> dict:
 
 
 def update_portfolio_prices():
-    """Update giá cho tất cả token"""
+    """Update giá cho tất cả token. Cột I (index 9) = Giá Hiện Tại."""
     sheet = get_sheet('Portfolio')
     if not sheet:
         return 0
@@ -246,13 +284,14 @@ def update_portfolio_prices():
     
     updated = 0
     for idx, row in df.iterrows():
-        contract = row.get('Contract', '')
-        network = row.get('Mạng', '')
+        contract = row.get(COL['contract'], '')
+        network = row.get(COL['network'], '')
         if not contract or not network:
             continue
         result = fetch_price_dexscreener(contract, network)
         if result['price'] > 0:
-            sheet.update_cell(idx + 2, 9, result['price'])
+            # idx + 2 vì row 1 là header, idx bắt đầu từ 0
+            sheet.update_cell(idx + 2, CURRENT_PRICE_COL_INDEX, result['price'])
             updated += 1
     st.cache_data.clear()
     return updated
@@ -265,7 +304,7 @@ with st.sidebar:
     
     page = st.radio(
         "📍 Menu",
-        ["📊 Dashboard", "➕ Thêm Giao Dịch", "📋 Portfolio", 
+        ["📊 Dashboard", "➕ Thêm Giao Dịch", "📋 Portfolio",
          "📜 Lịch Sử", "🔔 Cảnh Báo", "⚙️ Cài Đặt"]
     )
     
@@ -286,7 +325,6 @@ with st.sidebar:
     st.markdown("---")
     st.caption(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Hiển thị môi trường
     is_cloud = hasattr(st, 'secrets') and 'GOOGLE_SHEET_ID' in st.secrets
     env_label = "☁️ Cloud" if is_cloud else "💻 Local"
     
@@ -305,35 +343,62 @@ if page == "📊 Dashboard":
     if df_pf.empty:
         st.warning("⚠️ Chưa có dữ liệu. Vào 'Thêm Giao Dịch' để bắt đầu.")
     else:
-        money_cols = ['Tổng Chi USD', 'Giá Trị Hiện Tại', 'P&L USD', 
-                      'Giá TB Mua', 'Giá Hiện Tại', 'SL Đang Giữ']
-        for col in money_cols:
-            if col in df_pf.columns:
-                df_pf[col] = df_pf[col].apply(clean_number)
+        df_pf = clean_numeric_columns(df_pf)
         
-        if 'P&L %' in df_pf.columns:
-            df_pf['P&L %'] = df_pf['P&L %'].apply(clean_number)
-            if df_pf['P&L %'].abs().max() < 1 and df_pf['P&L %'].abs().max() > 0:
-                df_pf['P&L %'] = df_pf['P&L %'] * 100
+        # === TÍNH TOÁN TỪ CỘT MỚI ===
+        total_cost = df_pf[COL['total_cost']].sum() if COL['total_cost'] in df_pf else 0
+        total_value = df_pf[COL['current_value']].sum() if COL['current_value'] in df_pf else 0
+        total_sell_revenue = (df_pf[COL['total_sell_revenue']].sum()
+                              if COL['total_sell_revenue'] in df_pf else 0)
+        realized_pnl = (df_pf[COL['realized_pnl']].sum()
+                        if COL['realized_pnl'] in df_pf else 0)
+        unrealized_pnl = (df_pf[COL['unrealized_pnl']].sum()
+                          if COL['unrealized_pnl'] in df_pf else (total_value - total_cost))
         
-        total_cost = df_pf['Tổng Chi USD'].sum()
-        total_value = df_pf['Giá Trị Hiện Tại'].sum()
-        total_pnl = total_value - total_cost
+        # Total P&L từ công thức ĐÚNG
+        if COL['total_pnl'] in df_pf:
+            total_pnl = df_pf[COL['total_pnl']].sum()
+        else:
+            # Fallback nếu sheet chưa có cột Total P&L
+            total_pnl = realized_pnl + unrealized_pnl
+        
         roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0
-        num_tokens = (len(df_pf[df_pf['SL Đang Giữ'] > 0]) 
-                      if 'SL Đang Giữ' in df_pf.columns else len(df_pf))
+        num_tokens = (len(df_pf[df_pf[COL['holding']] > 0])
+                      if COL['holding'] in df_pf else len(df_pf))
         
+        # === ROW 1: 4 metric chính ===
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("💰 Vốn Đầu Tư", format_money(total_cost))
-        col2.metric("📈 Giá Trị Hiện Tại", format_money(total_value), 
+        col2.metric("📈 Giá Trị Hiện Tại", format_money(total_value),
                     f"{total_pnl:+,.2f}")
-        col3.metric("💵 P&L Tổng", format_money(total_pnl), format_pct(roi))
-        col4.metric("🪙 Số Token", f"{num_tokens}")
+        col3.metric("💵 Total P&L", format_money(total_pnl), format_pct(roi))
+        col4.metric("🪙 Số Token Giữ", f"{num_tokens}")
+        
+        # === ROW 2: 3 metric chi tiết P&L ===
+        st.markdown("##### 📊 Phân tích P&L chi tiết")
+        col_r1, col_r2, col_r3 = st.columns(3)
+        
+        col_r1.metric(
+            "💵 Realized P&L (đã chốt)",
+            format_money(realized_pnl),
+            help="Lãi/lỗ THỰC SỰ đã bỏ túi từ các giao dịch bán"
+        )
+        col_r2.metric(
+            "📊 Unrealized P&L (chưa chốt)",
+            format_money(unrealized_pnl),
+            help="Lãi/lỗ 'trên giấy' của số token còn đang giữ"
+        )
+        col_r3.metric(
+            "🎯 Tổng DT Đã Bán",
+            format_money(total_sell_revenue),
+            help="Tổng tiền đã thu về từ các giao dịch bán (đã trừ gas)"
+        )
         
         st.markdown("---")
         
-        if 'Mạng' in df_pf.columns and total_value > 0:
-            chain_alloc = df_pf.groupby('Mạng')['Giá Trị Hiện Tại'].sum()
+        # === CẢNH BÁO TẬP TRUNG ===
+        if COL['network'] in df_pf.columns and total_value > 0:
+            chain_alloc = df_pf.groupby(COL['network'])[COL['current_value']].sum()
             max_chain = chain_alloc.idxmax()
             max_pct = chain_alloc.max() / total_value * 100
             
@@ -344,51 +409,59 @@ if page == "📊 Dashboard":
                 st.warning(f"⚠️ **Cảnh báo**: {max_pct:.1f}% vốn đang ở **{max_chain}**. "
                            f"Cân nhắc đa dạng hóa.")
         
+        # === TOP LÃI / LỖ ===
         col_a, col_b = st.columns(2)
         with col_a:
-            st.subheader("🚀 Top Lãi")
-            cols_show = ['Token', 'Mạng', 'P&L USD', 'P&L %']
+            st.subheader("🚀 Top Lãi (Total P&L)")
+            cols_show = [COL['token'], COL['network'], COL['total_pnl'], COL['pnl_pct']]
             available_cols = [c for c in cols_show if c in df_pf.columns]
-            winners = df_pf.nlargest(5, 'P&L USD')[available_cols].copy()
-            winners['P&L USD'] = winners['P&L USD'].apply(format_money)
-            winners['P&L %'] = winners['P&L %'].apply(format_pct)
-            st.dataframe(winners, use_container_width=True, hide_index=True)
+            if COL['total_pnl'] in df_pf.columns:
+                winners = df_pf.nlargest(5, COL['total_pnl'])[available_cols].copy()
+                winners[COL['total_pnl']] = winners[COL['total_pnl']].apply(format_money)
+                winners[COL['pnl_pct']] = winners[COL['pnl_pct']].apply(format_pct)
+                st.dataframe(winners, use_container_width=True, hide_index=True)
         
         with col_b:
-            st.subheader("📉 Top Lỗ")
-            losers = df_pf.nsmallest(5, 'P&L USD')[available_cols].copy()
-            losers['P&L USD'] = losers['P&L USD'].apply(format_money)
-            losers['P&L %'] = losers['P&L %'].apply(format_pct)
-            st.dataframe(losers, use_container_width=True, hide_index=True)
+            st.subheader("📉 Top Lỗ (Total P&L)")
+            if COL['total_pnl'] in df_pf.columns:
+                losers = df_pf.nsmallest(5, COL['total_pnl'])[available_cols].copy()
+                losers[COL['total_pnl']] = losers[COL['total_pnl']].apply(format_money)
+                losers[COL['pnl_pct']] = losers[COL['pnl_pct']].apply(format_pct)
+                st.dataframe(losers, use_container_width=True, hide_index=True)
         
         st.markdown("---")
         
+        # === PHÂN BỔ THEO MẠNG ===
         col_c, col_d = st.columns([2, 3])
         with col_c:
             st.subheader("🌐 Phân Bổ Theo Mạng")
-            network_alloc = df_pf.groupby('Mạng')['Giá Trị Hiện Tại'].sum().reset_index()
-            network_alloc = network_alloc[network_alloc['Giá Trị Hiện Tại'] > 0]
-            network_alloc['%'] = (network_alloc['Giá Trị Hiện Tại'] / 
-                                   network_alloc['Giá Trị Hiện Tại'].sum() * 100).round(2)
-            network_alloc['Giá Trị Hiện Tại'] = network_alloc['Giá Trị Hiện Tại'].apply(format_money)
-            network_alloc['%'] = network_alloc['%'].apply(lambda x: f"{x:.2f}%")
-            st.dataframe(network_alloc, use_container_width=True, hide_index=True)
+            if COL['network'] in df_pf.columns:
+                network_alloc = df_pf.groupby(COL['network'])[COL['current_value']].sum().reset_index()
+                network_alloc = network_alloc[network_alloc[COL['current_value']] > 0]
+                if not network_alloc.empty:
+                    network_alloc['%'] = (network_alloc[COL['current_value']] /
+                                          network_alloc[COL['current_value']].sum() * 100).round(2)
+                    network_alloc[COL['current_value']] = (
+                        network_alloc[COL['current_value']].apply(format_money))
+                    network_alloc['%'] = network_alloc['%'].apply(lambda x: f"{x:.2f}%")
+                    st.dataframe(network_alloc, use_container_width=True, hide_index=True)
         
         with col_d:
             st.subheader("📊 Tỷ Trọng Vốn")
-            chain_data = df_pf.groupby('Mạng')['Giá Trị Hiện Tại'].sum()
-            chain_data = chain_data[chain_data > 0].sort_values(ascending=False)
-            if not chain_data.empty:
-                total = chain_data.sum()
-                for chain_name, value in chain_data.items():
-                    pct = (value / total * 100) if total > 0 else 0
-                    col_label, col_bar, col_val = st.columns([1, 4, 2])
-                    with col_label:
-                        st.write(f"**{chain_name}**")
-                    with col_bar:
-                        st.progress(min(pct / 100, 1.0))
-                    with col_val:
-                        st.write(f"${value:,.2f} ({pct:.1f}%)")
+            if COL['network'] in df_pf.columns:
+                chain_data = df_pf.groupby(COL['network'])[COL['current_value']].sum()
+                chain_data = chain_data[chain_data > 0].sort_values(ascending=False)
+                if not chain_data.empty:
+                    total = chain_data.sum()
+                    for chain_name, value in chain_data.items():
+                        pct = (value / total * 100) if total > 0 else 0
+                        col_label, col_bar, col_val = st.columns([1, 4, 2])
+                        with col_label:
+                            st.write(f"**{chain_name}**")
+                        with col_bar:
+                            st.progress(min(pct / 100, 1.0))
+                        with col_val:
+                            st.write(f"${value:,.2f} ({pct:.1f}%)")
 
 
 # ====================== PAGE: THÊM GIAO DỊCH ======================
@@ -435,18 +508,22 @@ elif page == "➕ Thêm Giao Dịch":
         with col2:
             amount = st.number_input("🔢 Số lượng Token", min_value=0.0, format="%.8f")
             price = st.number_input("💲 Giá/Token (USD)", min_value=0.0, format="%.10f")
-            pay_with = st.selectbox("💳 Thanh toán bằng", 
+            pay_with = st.selectbox("💳 Thanh toán bằng",
                                      ['USDT', 'USDC', 'ETH', 'BNB', 'SOL', 'BASE-ETH'])
             gas_fee = st.number_input("⛽ Phí Gas (USD)", min_value=0.0, format="%.4f")
             tx_hash = st.text_input("🔗 Tx Hash (optional)", placeholder="0x...")
         
         if amount > 0 and price > 0:
-            st.info(f"💵 **Tổng giá trị**: ${amount * price:,.4f} + phí ${gas_fee:.4f} = "
-                   f"**${amount * price + gas_fee:,.4f}**")
+            if tx_type == 'BUY':
+                st.info(f"💵 **Tổng chi**: ${amount * price:,.4f} + phí ${gas_fee:.4f} = "
+                       f"**${amount * price + gas_fee:,.4f}**")
+            else:
+                st.info(f"💵 **Tổng thu**: ${amount * price:,.4f} − phí ${gas_fee:.4f} = "
+                       f"**${amount * price - gas_fee:,.4f}**")
         
         note = st.text_area("📝 Ghi chú", placeholder="VD: DCA lần 3, mua khi dump")
         
-        submitted = st.form_submit_button("✅ Lưu Giao Dịch", type="primary", 
+        submitted = st.form_submit_button("✅ Lưu Giao Dịch", type="primary",
                                           use_container_width=True)
         
         if submitted:
@@ -464,6 +541,8 @@ elif page == "➕ Thêm Giao Dịch":
                     st.success(f"✅ Đã lưu giao dịch **{tx_type} {amount:,.0f} {token}** "
                               f"@ ${price:.10f}")
                     st.balloons()
+                    st.info("💡 Vào sheet Portfolio để thêm token mới vào bảng "
+                            "(nếu chưa có) — công thức sẽ tự tính khi token có trong sheet.")
 
 
 # ====================== PAGE: PORTFOLIO ======================
@@ -474,51 +553,74 @@ elif page == "📋 Portfolio":
     if df_pf.empty:
         st.warning("⚠️ Chưa có dữ liệu.")
     else:
-        money_cols = ['Tổng Chi USD', 'Giá Trị Hiện Tại', 'P&L USD', 
-                      'Giá TB Mua', 'Giá Hiện Tại', 'SL Đang Giữ']
-        for col in money_cols:
-            if col in df_pf.columns:
-                df_pf[col] = df_pf[col].apply(clean_number)
-        if 'P&L %' in df_pf.columns:
-            df_pf['P&L %'] = df_pf['P&L %'].apply(clean_number)
-            if df_pf['P&L %'].abs().max() < 1 and df_pf['P&L %'].abs().max() > 0:
-                df_pf['P&L %'] = df_pf['P&L %'] * 100
+        df_pf = clean_numeric_columns(df_pf)
         
         col1, col2, col3 = st.columns([2, 2, 1])
         with col1:
-            filter_network = st.multiselect("🌐 Lọc mạng", 
-                                            options=df_pf['Mạng'].unique(),
-                                            default=df_pf['Mạng'].unique())
+            networks_available = df_pf[COL['network']].unique() if COL['network'] in df_pf else []
+            filter_network = st.multiselect("🌐 Lọc mạng",
+                                            options=networks_available,
+                                            default=networks_available)
         with col2:
-            sort_by = st.selectbox("🔃 Sắp xếp theo", 
-                                    ['P&L USD ↓', 'P&L USD ↑', 'P&L % ↓', 'P&L % ↑', 
-                                     'Giá Trị ↓', 'Token A-Z'])
+            sort_options = ['Total P&L ↓', 'Total P&L ↑', 'Realized ↓', 'Unrealized ↓',
+                            'P&L % ↓', 'P&L % ↑', 'Giá Trị ↓', 'Token A-Z']
+            sort_by = st.selectbox("🔃 Sắp xếp theo", sort_options)
         with col3:
             show_only_holding = st.checkbox("Chỉ đang giữ", value=True)
         
-        df_filtered = df_pf[df_pf['Mạng'].isin(filter_network)].copy()
-        if show_only_holding and 'SL Đang Giữ' in df_filtered.columns:
-            df_filtered = df_filtered[df_filtered['SL Đang Giữ'] > 0]
+        df_filtered = df_pf.copy()
+        if filter_network and COL['network'] in df_filtered:
+            df_filtered = df_filtered[df_filtered[COL['network']].isin(filter_network)]
+        if show_only_holding and COL['holding'] in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered[COL['holding']] > 0]
         
         sort_map = {
-            'P&L USD ↓': ('P&L USD', False), 'P&L USD ↑': ('P&L USD', True),
-            'P&L % ↓': ('P&L %', False), 'P&L % ↑': ('P&L %', True),
-            'Giá Trị ↓': ('Giá Trị Hiện Tại', False), 'Token A-Z': ('Token', True),
+            'Total P&L ↓': (COL['total_pnl'], False),
+            'Total P&L ↑': (COL['total_pnl'], True),
+            'Realized ↓': (COL['realized_pnl'], False),
+            'Unrealized ↓': (COL['unrealized_pnl'], False),
+            'P&L % ↓': (COL['pnl_pct'], False),
+            'P&L % ↑': (COL['pnl_pct'], True),
+            'Giá Trị ↓': (COL['current_value'], False),
+            'Token A-Z': (COL['token'], True),
         }
         if sort_by in sort_map:
-            col, asc = sort_map[sort_by]
-            if col in df_filtered.columns:
-                df_filtered = df_filtered.sort_values(col, ascending=asc)
+            col_name, asc = sort_map[sort_by]
+            if col_name in df_filtered.columns:
+                df_filtered = df_filtered.sort_values(col_name, ascending=asc)
+        
+        # Cấu hình hiển thị cột
+        column_config = {
+            COL['total_cost']: st.column_config.NumberColumn(format="$%.2f"),
+            COL['avg_buy_price']: st.column_config.NumberColumn(format="$%.10f"),
+            COL['current_price']: st.column_config.NumberColumn(format="$%.10f"),
+            COL['avg_sell_price']: st.column_config.NumberColumn(format="$%.10f"),
+            COL['current_value']: st.column_config.NumberColumn(format="$%.2f"),
+            COL['total_sell_revenue']: st.column_config.NumberColumn(format="$%.2f"),
+            COL['realized_pnl']: st.column_config.NumberColumn(format="$%.2f"),
+            COL['unrealized_pnl']: st.column_config.NumberColumn(format="$%.2f"),
+            COL['total_pnl']: st.column_config.NumberColumn(format="$%.2f"),
+            COL['pnl_pct']: st.column_config.NumberColumn(format="%.2f%%"),
+            COL['portfolio_pct']: st.column_config.NumberColumn(format="%.2f%%"),
+        }
         
         st.dataframe(df_filtered, use_container_width=True, hide_index=True,
-                     column_config={
-                         "Tổng Chi USD": st.column_config.NumberColumn(format="$%.2f"),
-                         "Giá TB Mua": st.column_config.NumberColumn(format="$%.10f"),
-                         "Giá Hiện Tại": st.column_config.NumberColumn(format="$%.10f"),
-                         "Giá Trị Hiện Tại": st.column_config.NumberColumn(format="$%.2f"),
-                         "P&L USD": st.column_config.NumberColumn(format="$%.2f"),
-                         "P&L %": st.column_config.NumberColumn(format="%.2f%%"),
-                     })
+                     column_config=column_config)
+        
+        # === Summary phía dưới ===
+        if not df_filtered.empty:
+            st.markdown("##### 📊 Tóm tắt theo bộ lọc")
+            c1, c2, c3, c4 = st.columns(4)
+            
+            sum_cost = df_filtered[COL['total_cost']].sum() if COL['total_cost'] in df_filtered else 0
+            sum_value = df_filtered[COL['current_value']].sum() if COL['current_value'] in df_filtered else 0
+            sum_realized = df_filtered[COL['realized_pnl']].sum() if COL['realized_pnl'] in df_filtered else 0
+            sum_unrealized = df_filtered[COL['unrealized_pnl']].sum() if COL['unrealized_pnl'] in df_filtered else 0
+            
+            c1.metric("Vốn", format_money(sum_cost))
+            c2.metric("Giá Trị", format_money(sum_value))
+            c3.metric("Realized", format_money(sum_realized))
+            c4.metric("Unrealized", format_money(sum_unrealized))
 
 
 # ====================== PAGE: LỊCH SỬ ======================
@@ -542,7 +644,7 @@ elif page == "📜 Lịch Sử":
     else:
         col1, col2, col3 = st.columns(3)
         with col1:
-            filter_token = st.multiselect("🪙 Token", 
+            filter_token = st.multiselect("🪙 Token",
                                           options=df_tx['Token'].unique() if 'Token' in df_tx else [],
                                           default=[])
         with col2:
@@ -560,7 +662,13 @@ elif page == "📜 Lịch Sử":
         if filter_network:
             df_show = df_show[df_show['Mạng'].isin(filter_network)]
         
-        st.caption(f"📌 Hiển thị {len(df_show)}/{len(df_tx)} giao dịch")
+        # Hiển thị thống kê nhanh
+        if 'Loại' in df_show.columns:
+            buy_count = len(df_show[df_show['Loại'] == 'BUY'])
+            sell_count = len(df_show[df_show['Loại'] == 'SELL'])
+            st.caption(f"📌 Hiển thị {len(df_show)}/{len(df_tx)} giao dịch — "
+                       f"🟢 BUY: {buy_count} | 🔴 SELL: {sell_count}")
+        
         st.dataframe(df_show, use_container_width=True, hide_index=True)
         
         csv = df_show.to_csv(index=False).encode('utf-8-sig')
@@ -585,7 +693,7 @@ elif page == "🔔 Cảnh Báo":
             with col1:
                 a_token = st.text_input("Token")
                 a_network = st.selectbox("Mạng", list(NETWORKS.keys()), key='alert_net')
-                a_type = st.selectbox("Loại", ['TAKE_PROFIT', 'STOP_LOSS', 
+                a_type = st.selectbox("Loại", ['TAKE_PROFIT', 'STOP_LOSS',
                                                 'PRICE_ABOVE', 'PRICE_BELOW'])
             with col2:
                 a_price = st.number_input("Giá Trigger (USD)", min_value=0.0, format="%.10f")
@@ -595,7 +703,7 @@ elif page == "🔔 Cảnh Báo":
                 if a_token and a_price > 0:
                     sheet = get_sheet('Alerts')
                     if sheet:
-                        sheet.append_row([a_token.upper(), a_network, a_type, a_price, 
+                        sheet.append_row([a_token.upper(), a_network, a_type, a_price,
                                          'ACTIVE', '', a_note])
                         st.success("✅ Đã thêm alert!")
                         st.cache_data.clear()
@@ -621,15 +729,15 @@ elif page == "⚙️ Cài Đặt":
     st.subheader("🔑 Kết Nối Hiện Tại")
     col1, col2 = st.columns(2)
     with col1:
-        st.text_input("Google Sheet ID", value=SHEET_ID if SHEET_ID else "(chưa cấu hình)", 
+        st.text_input("Google Sheet ID", value=SHEET_ID if SHEET_ID else "(chưa cấu hình)",
                       disabled=True)
     with col2:
         tg_token = get_config('TELEGRAM_BOT_TOKEN')
-        st.text_input("Telegram Bot Token", 
+        st.text_input("Telegram Bot Token",
                       value=(tg_token[:10] + "...") if tg_token else "(chưa cấu hình)",
                       disabled=True)
-        st.text_input("Telegram Chat ID", 
-                      value=get_config('TELEGRAM_CHAT_ID', '(chưa cấu hình)'), 
+        st.text_input("Telegram Chat ID",
+                      value=get_config('TELEGRAM_CHAT_ID', '(chưa cấu hình)'),
                       disabled=True)
     
     st.markdown("---")
@@ -665,18 +773,38 @@ elif page == "⚙️ Cài Đặt":
                 st.write(f"**File**: {ss.title}")
                 st.write(f"**URL**: {ss.url}")
                 st.write(f"**Sheets**: {', '.join([s.title for s in ss.worksheets()])}")
+                
+                # Check cấu trúc cột Portfolio
+                try:
+                    pf = ss.worksheet('Portfolio')
+                    headers = pf.row_values(1)
+                    st.markdown("**Các cột trong Portfolio sheet:**")
+                    st.code(" | ".join(headers))
+                    
+                    required = [COL['total_pnl'], COL['realized_pnl'],
+                                COL['unrealized_pnl'], COL['total_sell_revenue']]
+                    missing = [c for c in required if c not in headers]
+                    if missing:
+                        st.error(f"❌ Thiếu cột: {', '.join(missing)}. "
+                                 f"Vui lòng upload lại file đã sửa P&L!")
+                    else:
+                        st.success("✅ Cấu trúc cột ĐÚNG. App sẽ chạy bình thường.")
+                except Exception as e:
+                    st.warning(f"⚠️ Không đọc được Portfolio: {e}")
             except Exception as e:
                 st.error(f"❌ {e}")
     
     st.markdown("---")
     st.subheader("📖 Hướng Dẫn")
     st.markdown("""
-    Xem **README.md** và **DEPLOY_GUIDE.md** trong repo để biết cách setup từng bước.
+    **App v4 — Đã sửa P&L tính sai**
     
-    **Tóm tắt nhanh:**
-    1. Setup Google Service Account + bật API Sheets & Drive
-    2. Share Google Sheet (Editor) cho email service account
-    3. Tạo Telegram bot qua @BotFather
-    4. Cấu hình `.env` (local) hoặc Streamlit Secrets (cloud)
-    5. Chạy app: `streamlit run app.py`
+    Yêu cầu Google Sheet phải có cấu trúc Portfolio MỚI (sau khi sửa):
+    - `Token | Mạng | Contract | Tổng SL Mua | Tổng SL Bán | SL Đang Giữ`
+    - `Tổng Chi USD | Giá TB Mua | Giá Hiện Tại`
+    - `Tổng DT Bán USD | Giá TB Bán | Giá Trị Hiện Tại` ← MỚI
+    - `Realized P&L | Unrealized P&L | Total P&L | P&L %` ← MỚI
+    - `Target Chốt Lời | Stop Loss | % Danh Mục`
+    
+    Nếu chưa có cấu trúc mới, upload file Excel đã sửa lên Google Drive trước.
     """)
